@@ -8,6 +8,14 @@
 			"url": "ws://localhost:8888/2dc3gzl5xot",
 			"stopOnEntry": false,
 			"internalConsoleOptions": "neverOpen"
+		},
+		{
+			"type": "bun",
+			"request": "attach",
+			"name": "Attach to Bun (Headless Core)",
+			"url": "ws://localhost:8888/2dc3gzl5xot",
+			"stopOnEntry": false,
+			"internalConsoleOptions": "neverOpen"
 		}
 	]
 }

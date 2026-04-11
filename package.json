@@ -41,6 +41,8 @@
     "build": "bun run build.ts",
     "dev": "bun run scripts/dev.ts",
     "dev:inspect": "bun run scripts/dev-debug.ts",
+    "dev:headless-core": "bun run scripts/dev-headless-core.ts",
+    "dev:headless-core:inspect": "bun run scripts/dev-headless-core-debug.ts",
     "prepublishOnly": "bun run build",
     "lint": "biome lint src/",
     "lint:fix": "biome lint --fix src/",

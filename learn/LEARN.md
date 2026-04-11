@@ -4,6 +4,19 @@
 >
 > 各阶段详细笔记见同目录下的 `phase-*.md` 文件
 
+## 先看这个：Headless agent → tool 主链
+
+如果你的目标是直接调试 agent 如何调用工具，不想先被 UI、插件、外围模式分散注意力，先读这两篇：
+
+- [phase-3-headless-agent-tool-flow.md](phase-3-headless-agent-tool-flow.md) — `--print` 路径下的核心调用链、断点、关键状态
+- [phase-3-debug-checklist.md](phase-3-debug-checklist.md) — 可直接运行的命令矩阵、建议观察变量、扩展场景
+
+推荐顺序：
+
+1. 先跑 `bun run dev:headless-core`
+2. 再跑 `bun run dev:headless-core:inspect`
+3. 命中 `query.ts` 和 `toolExecution.ts` 的断点后，再回头补读第一、二阶段
+
 ## 第一阶段：启动流程（入口链路） ✅
 
 详细笔记：[phase-1-startup-flow.md](phase-1-startup-flow.md)
