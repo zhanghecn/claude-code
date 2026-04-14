@@ -88,7 +88,7 @@ import {
 } from './utils/tokens.js'
 import { ESCALATED_MAX_TOKENS } from './utils/context.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from './services/analytics/growthbook.js'
-import { SLEEP_TOOL_NAME } from './tools/SleepTool/prompt.js'
+import { SLEEP_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/SleepTool/prompt.js'
 import { executePostSamplingHooks } from './utils/hooks/postSamplingHooks.js'
 import { executeStopFailureHooks } from './utils/hooks.js'
 import type { QuerySource } from './constants/querySource.js'
@@ -107,9 +107,12 @@ import {
   getCurrentTurnTokenBudget,
   getTurnOutputTokens,
   incrementBudgetContinuationCount,
+  getSessionId,
 } from './bootstrap/state.js'
 import { createBudgetTracker, checkTokenBudget } from './query/tokenBudget.js'
 import { count } from './utils/array.js'
+import { createTrace, endTrace, isLangfuseEnabled } from './services/langfuse/index.js'
+import { getAPIProvider } from './utils/model/providers.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const snipModule = feature('HISTORY_SNIP')
@@ -227,7 +230,43 @@ export async function* query(
   Terminal
 > {
   const consumedCommandUuids: string[] = []
-  const terminal = yield* queryLoop(params, consumedCommandUuids)
+
+  // Create Langfuse trace for this query turn (no-op if not configured).
+  // When called as a sub-agent, langfuseTrace is already set by runAgent()
+  // — reuse it instead of creating an independent trace.
+  const ownsTrace = !params.toolUseContext.langfuseTrace
+  const langfuseTrace = params.toolUseContext.langfuseTrace
+    ?? (isLangfuseEnabled()
+      ? createTrace({
+          sessionId: getSessionId(),
+          model: params.toolUseContext.options.mainLoopModel,
+          provider: getAPIProvider(),
+          input: params.messages,
+          querySource: params.querySource,
+        })
+      : null)
+
+  // Attach trace to toolUseContext so tool execution can record observations
+  const paramsWithTrace: QueryParams = langfuseTrace
+    ? {
+        ...params,
+        toolUseContext: { ...params.toolUseContext, langfuseTrace },
+      }
+    : params
+
+  let terminal: Terminal | undefined
+  try {
+    terminal = yield* queryLoop(paramsWithTrace, consumedCommandUuids)
+  } finally {
+    // Only end the trace if we created it — sub-agents own their traces
+    if (ownsTrace) {
+      const isAborted =
+        terminal?.reason === 'aborted_streaming' ||
+        terminal?.reason === 'aborted_tools'
+      endTrace(langfuseTrace, undefined, isAborted ? 'interrupted' : undefined)
+    }
+  }
+
   // Only reached if queryLoop returned normally. Skipped on throw (error
   // propagates through yield*) and on .return() (Return completion closes
   // both generators). This gives the same asymmetric started-without-completed
@@ -235,7 +274,8 @@ export async function* query(
   for (const uuid of consumedCommandUuids) {
     notifyCommandLifecycle(uuid, 'completed')
   }
-  return terminal
+  // biome-ignore lint/style/noNonNullAssertion: terminal is always assigned when queryLoop returns normally
+  return terminal!
 }
 
 async function* queryLoop(
@@ -704,6 +744,7 @@ async function* queryLoop(
                   }),
                 },
               }),
+              langfuseTrace: toolUseContext.langfuseTrace,
             },
           })) {
             // We won't use the tool_calls from the first attempt

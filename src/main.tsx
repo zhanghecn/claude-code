@@ -75,7 +75,7 @@ import type { ToolInputJSONSchema } from "./Tool.js";
 import {
 	createSyntheticOutputTool,
 	isSyntheticOutputToolEnabled,
-} from "./tools/SyntheticOutputTool/SyntheticOutputTool.js";
+} from "@claude-code-best/builtin-tools/tools/SyntheticOutputTool/SyntheticOutputTool.js";
 import { getTools } from "./tools.js";
 import {
 	canUserConfigureAdvisor,
@@ -192,14 +192,14 @@ import {
 	VALID_UPDATE_SCOPES,
 } from "./services/plugins/pluginCliCommands.js";
 import { initBundledSkills } from "./skills/bundled/index.js";
-import type { AgentColorName } from "./tools/AgentTool/agentColorManager.js";
+import type { AgentColorName } from "@claude-code-best/builtin-tools/tools/AgentTool/agentColorManager.js";
 import {
 	getActiveAgentsFromList,
 	getAgentDefinitionsWithOverrides,
 	isBuiltInAgent,
 	isCustomAgent,
 	parseAgentsFromJson,
-} from "./tools/AgentTool/loadAgentsDir.js";
+} from "@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js";
 import type { LogOption } from "./types/logs.js";
 import type { Message as MessageType } from "./types/message.js";
 import {
@@ -1122,14 +1122,15 @@ export async function main() {
 		}
 	}
 
-	// Check for -p/--print and --init-only flags early to set isInteractiveSession before init()
-	// This is needed because telemetry initialization calls auth functions that need this flag
-	const cliArgs = process.argv.slice(2);
-	const hasPrintFlag = cliArgs.includes("-p") || cliArgs.includes("--print");
-	const hasInitOnlyFlag = cliArgs.includes("--init-only");
-	const hasSdkUrl = cliArgs.some((arg) => arg.startsWith("--sdk-url"));
-	const isNonInteractive =
-		hasPrintFlag || hasInitOnlyFlag || hasSdkUrl || !process.stdout.isTTY;
+		// Check for -p/--print and --init-only flags early to set isInteractiveSession before init()
+		// This is needed because telemetry initialization calls auth functions that need this flag
+		const cliArgs = process.argv.slice(2);
+		const hasPrintFlag = cliArgs.includes("-p") || cliArgs.includes("--print");
+		const hasInitOnlyFlag = cliArgs.includes("--init-only");
+		const hasSdkUrl = cliArgs.some((arg) => arg.startsWith("--sdk-url"));
+		const forceInteractive = isEnvTruthy(process.env.CLAUDE_CODE_FORCE_INTERACTIVE);
+		const isNonInteractive =
+			hasPrintFlag || hasInitOnlyFlag || hasSdkUrl || (!forceInteractive && !process.stdout.isTTY);
 
 	// Stop capturing early input for non-interactive modes
 	if (isNonInteractive) {
@@ -2269,7 +2270,17 @@ async function run(): Promise<CommanderCommand> {
 			}
 
 			// Parse the MCP config files/strings if provided
-			let dynamicMcpConfig: Record<string, ScopedMcpServerConfig> = {};
+			let dynamicMcpConfig: Record<string, ScopedMcpServerConfig> = {
+				// Built-in MCP servers (default disabled, user enables via /mcp)
+				"mcp-chrome": {
+					type: "http",
+					url: "http://127.0.0.1:12306/mcp",
+					scope: "dynamic",
+					"headers": {
+						"Authorization": "Bearer my-static-token",
+					}
+				},
+			};
 
 			if (mcpConfig && mcpConfig.length > 0) {
 				// Process mcpConfig array
@@ -2663,9 +2674,9 @@ async function run(): Promise<CommanderCommand> {
 			) {
 				/* eslint-disable @typescript-eslint/no-require-imports */
 				const { BRIEF_TOOL_NAME, LEGACY_BRIEF_TOOL_NAME } =
-					require("./tools/BriefTool/prompt.js") as typeof import("./tools/BriefTool/prompt.js");
+					require("@claude-code-best/builtin-tools/tools/BriefTool/prompt.js") as typeof import("@claude-code-best/builtin-tools/tools/BriefTool/prompt.js");
 				const { isBriefEntitled } =
-					require("./tools/BriefTool/BriefTool.js") as typeof import("./tools/BriefTool/BriefTool.js");
+					require("@claude-code-best/builtin-tools/tools/BriefTool/BriefTool.js") as typeof import("@claude-code-best/builtin-tools/tools/BriefTool/BriefTool.js");
 				/* eslint-enable @typescript-eslint/no-require-imports */
 				const parsed = parseToolListFromCLI(baseTools);
 				if (
@@ -3309,7 +3320,7 @@ async function run(): Promise<CommanderCommand> {
 			) {
 				/* eslint-disable @typescript-eslint/no-require-imports */
 				const { isBriefEntitled } =
-					require("./tools/BriefTool/BriefTool.js") as typeof import("./tools/BriefTool/BriefTool.js");
+					require("@claude-code-best/builtin-tools/tools/BriefTool/BriefTool.js") as typeof import("@claude-code-best/builtin-tools/tools/BriefTool/BriefTool.js");
 				/* eslint-enable @typescript-eslint/no-require-imports */
 				if (isBriefEntitled()) {
 					setUserMsgOptIn(true);
@@ -3328,7 +3339,7 @@ async function run(): Promise<CommanderCommand> {
 				const briefVisibility =
 					feature("KAIROS") || feature("KAIROS_BRIEF")
 						? (
-								require("./tools/BriefTool/BriefTool.js") as typeof import("./tools/BriefTool/BriefTool.js")
+								require("@claude-code-best/builtin-tools/tools/BriefTool/BriefTool.js") as typeof import("@claude-code-best/builtin-tools/tools/BriefTool/BriefTool.js")
 							).isBriefEnabled()
 							? "Call SendUserMessage at checkpoints to mark where things stand."
 							: "The user will see any text you output."
@@ -6898,7 +6909,7 @@ function maybeActivateBrief(options: unknown): void {
 	// into external builds via BriefTool.ts → prompt.ts.
 	/* eslint-disable @typescript-eslint/no-require-imports */
 	const { isBriefEntitled } =
-		require("./tools/BriefTool/BriefTool.js") as typeof import("./tools/BriefTool/BriefTool.js");
+		require("@claude-code-best/builtin-tools/tools/BriefTool/BriefTool.js") as typeof import("@claude-code-best/builtin-tools/tools/BriefTool/BriefTool.js");
 	/* eslint-enable @typescript-eslint/no-require-imports */
 	const entitled = isBriefEntitled();
 	if (entitled) {
