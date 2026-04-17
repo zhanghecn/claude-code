@@ -4,37 +4,23 @@
 
 ## 1. 启动命令
 
-最短链：
-
-```bash
-bun run dev:headless-core
-```
-
 附加断点：
 
 ```bash
-bun run dev:headless-core:inspect
+bun run scripts/dev-headless-core-debug.ts --preset core_loop
 ```
 
 想看更完整的多工具链：
 
 ```bash
-bun run dev:headless-core --bare --print --output-format stream-json --verbose \
-  --permission-mode default --max-turns 5 \
-  --tools Glob,Grep,Read,Bash \
-  --allowedTools Glob Grep Read Bash \
-  -- \
+bun run scripts/dev-headless-core-debug.ts --prompt \
   "请先用 Glob 和 Grep 找出仓库里调用 runHeadless 的地方，再读取关键源码，最后用 Bash 执行 pwd。"
 ```
 
 想看写入闭环：
 
 ```bash
-bun run dev:headless-core --print --output-format stream-json --verbose \
-  --permission-mode default --max-turns 6 \
-  --tools Read,Edit,Bash \
-  --allowedTools Read Edit Bash \
-  -- \
+bun run scripts/dev-headless-core-debug.ts --prompt \
   "请先阅读一个小文件，做一个极小改动，再用 Bash 运行对应检查命令。"
 ```
 
@@ -42,7 +28,7 @@ bun run dev:headless-core --print --output-format stream-json --verbose \
 
 ## 2. VS Code 调试步骤
 
-1. 运行 `bun run dev:headless-core:inspect`
+1. 运行 `bun run scripts/dev-headless-core-debug.ts --preset core_loop`
 2. 在以下位置下断点
 3. F5 选择 `Attach to Bun (Headless Core)`
 4. 让流程自己跑，不要一开始从入口一路 step into 到底

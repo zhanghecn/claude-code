@@ -1864,15 +1864,15 @@ function runHeadlessStreaming(
       return
     }
 
-    running = true
+    running = true  //只允许要给run在跑
     runPhase = undefined
-    notifySessionStateChanged('running')
+    notifySessionStateChanged('running')  //通知运行状态为running
     idleTimeout.stop()
 
     headlessProfilerCheckpoint('run_entry')
     // TODO(custom-tool-refactor): Should move to the init message, like browser
 
-    await updateSdkMcp()
+    await updateSdkMcp() //确认有哪些 MCP 和 工具可用
     headlessProfilerCheckpoint('after_updateSdkMcp')
 
     // Resolve deferred plugin installation (CLAUDE_CODE_SYNC_PLUGIN_INSTALL).
@@ -1880,7 +1880,7 @@ function runHeadlessStreaming(
     // Awaiting here guarantees plugins are available before the first ask().
     // If CLAUDE_CODE_SYNC_PLUGIN_INSTALL_TIMEOUT_MS is set, races against that
     // deadline and proceeds without plugins on timeout (logging an error).
-    if (pluginInstallPromise) {
+    if (pluginInstallPromise) { //是否等待插件安装完成
       const timeoutMs = parseInt(
         process.env.CLAUDE_CODE_SYNC_PLUGIN_INSTALL_TIMEOUT_MS || '',
         10,
@@ -1918,7 +1918,7 @@ function runHeadlessStreaming(
     // notifications are drained by the subagent's mid-turn gate in query.ts.
     // Defined outside the try block so it's accessible in the post-finally
     // queue re-checks at the bottom of run().
-    const isMainThread = (cmd: QueuedCommand) => cmd.agentId === undefined
+    const isMainThread = (cmd: QueuedCommand) => cmd.agentId === undefined //这次 run 只处理主线程命令
 
     try {
       let command: QueuedCommand | undefined
@@ -1928,7 +1928,7 @@ function runHeadlessStreaming(
       // Drains the queue, batching consecutive prompt-mode commands into one
       // ask() call so messages that queued up during a long turn coalesce
       // into a single follow-up turn instead of N separate turns.
-      const drainCommandQueue = async () => {
+      const drainCommandQueue = async () => { //真正开始“吃队列”
         while ((command = dequeue(isMainThread))) {
           if (
             command.mode !== 'prompt' &&
@@ -1983,7 +1983,7 @@ function runHeadlessStreaming(
           // per-server by main.tsx (mirrors useManageMCPConnections). Reading
           // fresh per-command means late-connecting servers are visible on the
           // next turn. registerElicitationHandlers is idempotent (tracking set).
-          const appState = getAppState()
+          const appState = getAppState()  //每次命令都获取最新mcp工具列表
           const allMcpClients = [
             ...appState.mcp.clients,
             ...sdkClients,
@@ -2001,8 +2001,8 @@ function runHeadlessStreaming(
 
           const allTools = buildAllTools(appState)
 
-          for (const uuid of batchUuids) {
-            notifyCommandLifecycle(uuid, 'started')
+          for (const uuid of batchUuids) { //合并后 批次每个uuid 都标记为 started
+            notifyCommandLifecycle(uuid, 'started') //通知每个uuid 开始执行
           }
 
           // Task notifications arrive when background agents complete.
@@ -2010,7 +2010,7 @@ function runHeadlessStreaming(
           // to ask() so the model sees the agent result and can act on it.
           // This matches TUI behavior where useQueueProcessor always feeds
           // notifications to the model regardless of coordinator mode.
-          if (command.mode === 'task-notification') {
+          if (command.mode === 'task-notification') { //先发系统事件，再继续喂给模型
             const notificationText =
               typeof command.value === 'string' ? command.value : ''
             // Parse the XML-formatted notification
@@ -2100,7 +2100,7 @@ function runHeadlessStreaming(
           }
 
           // Abort any in-flight suggestion generation and track acceptance
-          suggestionState.abortController?.abort()
+          suggestionState.abortController?.abort() //新命令来了 旧 suggestionState 作废
           suggestionState.abortController = null
           suggestionState.pendingSuggestion = null
           suggestionState.pendingLastEmittedEntry = null
@@ -2128,7 +2128,7 @@ function runHeadlessStreaming(
             }
           }
 
-          abortController = createAbortController()
+          abortController = createAbortController() //创建新的 abortController
           const turnStartTime = feature('FILE_PERSISTENCE')
             ? Date.now()
             : undefined
@@ -2370,7 +2370,7 @@ function runHeadlessStreaming(
       do {
         // Drain SDK events (task_started, task_progress) before command queue
         // so progress events precede task_notification on the stream.
-        for (const event of drainSdkEvents()) {
+        for (const event of drainSdkEvents()) { //故意把积压事件先消耗完
           output.enqueue(event)
         }
 
@@ -2411,7 +2411,7 @@ function runHeadlessStreaming(
           output.enqueue(suggestionState.pendingSuggestion)
           // Now that the suggestion is actually delivered, record it for acceptance tracking
           if (suggestionState.pendingLastEmittedEntry) {
-            suggestionState.lastEmitted = {
+            suggestionState.lastEmitted = { 
               ...suggestionState.pendingLastEmittedEntry,
               emittedAt: Date.now(),
             }

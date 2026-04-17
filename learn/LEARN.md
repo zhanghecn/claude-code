@@ -11,11 +11,19 @@
 - [phase-3-headless-agent-tool-flow.md](phase-3-headless-agent-tool-flow.md) — `--print` 路径下的核心调用链、断点、关键状态
 - [phase-3-debug-checklist.md](phase-3-debug-checklist.md) — 可直接运行的命令矩阵、建议观察变量、扩展场景
 
+如果你已经开始读 `src/cli/print.ts`，再补这一篇：
+
+- [phase-3-runHeadlessStreaming.md](phase-3-runHeadlessStreaming.md) — 只拆 `runHeadlessStreaming()`，重点看输入循环、内部队列、`run()` 主执行器和并发边界
+- [phase-4-query-loop.md](phase-4-query-loop.md) — 接着往下钻 `query()` / `queryLoop()`，重点看状态机、模型流、工具循环、恢复分支和下一轮递归
+- [phase-3-dev-headless-core-usage.md](phase-3-dev-headless-core-usage.md) — `scripts/dev-headless-core-debug.ts` + `launch.json` 的使用手册，重点看怎么切 prompt 预设、怎么跑可断点调试命令、每个预设该看哪些断点
+
 推荐顺序：
 
-1. 先跑 `bun run dev:headless-core`
-2. 再跑 `bun run dev:headless-core:inspect`
-3. 命中 `query.ts` 和 `toolExecution.ts` 的断点后，再回头补读第一、二阶段
+1. 先跑 `bun run scripts/dev-headless-core-debug.ts --preset core_loop`
+2. 再用 VS Code 选择 `Attach to Bun (Headless Core)`
+3. 先读 `phase-3-runHeadlessStreaming.md`
+4. 再读 `phase-4-query-loop.md`
+5. 命中 `query.ts` 和 `toolExecution.ts` 的断点后，再回头补读第一、二阶段
 
 ## 第一阶段：启动流程（入口链路） ✅
 

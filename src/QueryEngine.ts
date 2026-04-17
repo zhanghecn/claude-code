@@ -235,7 +235,7 @@ export class QueryEngine {
       agents = [],
       setSDKStatus,
       orphanedPermission,
-    } = this.config
+    } = this.config //读配置 包权限函数
 
     this.discoveredSkillNames.clear()
     setCwd(cwd)

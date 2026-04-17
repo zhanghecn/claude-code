@@ -9,7 +9,7 @@
 最短真实命令：
 
 ```bash
-bun run dev:headless-core
+bun run scripts/dev-headless-core-debug.ts --preset bash_pwd
 ```
 
 默认等价于：
@@ -25,7 +25,7 @@ bun run dev --bare --print --output-format stream-json --verbose \
 调试版本：
 
 ```bash
-bun run dev:headless-core:inspect
+bun run scripts/dev-headless-core-debug.ts --preset bash_pwd
 ```
 
 VS Code 直接附着：
@@ -347,7 +347,7 @@ scripts/dev-headless-core.ts
 ### 场景 A：只看最短 Bash 链
 
 ```bash
-bun run dev:headless-core
+bun run scripts/dev-headless-core-debug.ts --preset bash_pwd
 ```
 
 目标：
@@ -357,11 +357,7 @@ bun run dev:headless-core
 ### 场景 B：看搜索 -> 读取 -> 决策 -> 执行
 
 ```bash
-bun run dev:headless-core --bare --print --output-format stream-json --verbose \
-  --permission-mode default --max-turns 5 \
-  --tools Glob,Grep,Read,Bash \
-  --allowedTools Glob Grep Read Bash \
-  -- \
+bun run scripts/dev-headless-core-debug.ts --prompt \
   "请先用 Glob 和 Grep 找出仓库里调用 runHeadless 的地方，再读取最关键的源码，并用 Bash 执行 pwd 验证当前目录。"
 ```
 
@@ -373,11 +369,7 @@ bun run dev:headless-core --bare --print --output-format stream-json --verbose \
 ### 场景 C：看写入闭环
 
 ```bash
-bun run dev:headless-core --print --output-format stream-json --verbose \
-  --permission-mode default --max-turns 6 \
-  --tools Read,Edit,Bash \
-  --allowedTools Read Edit Bash \
-  -- \
+bun run scripts/dev-headless-core-debug.ts --prompt \
   "请阅读一个小文件，做一个极小改动，然后用 Bash 跑对应检查命令验证。"
 ```
 
