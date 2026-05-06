@@ -4,6 +4,16 @@
 >
 > 各阶段详细笔记见同目录下的 `phase-*.md` 文件
 
+## 当前入口
+
+现在优先看这三份索引，不要直接从所有 `phase-*.md` 里硬挑：
+
+- [INDEX.md](INDEX.md) — 阅读顺序、必读/选读/可跳读文档取舍
+- [glossary.md](glossary.md) — 高频概念词典，例如 `Message`、`State`、`deps`、`Langfuse trace`
+- [source-map.md](source-map.md) — 源码文件地图，说明每个关键文件负责什么、从哪个函数看起
+
+下面保留原阶段路线，作为更完整的学习记录。
+
 ## 先看这个：Headless agent → tool 主链
 
 如果你的目标是直接调试 agent 如何调用工具，不想先被 UI、插件、外围模式分散注意力，先读这两篇：
@@ -61,6 +71,12 @@
 详细笔记：[phase-2-conversation-loop.md](phase-2-conversation-loop.md)
 
 理解用户发一句话后，如何变成 API 请求、如何处理流式响应和工具调用。
+
+如果你想先把 `ask()` / `QueryEngine.submitMessage()` 一行行拆明白，再去看更大的 query loop，先补这一篇：
+
+- [phase-2-ask-submitMessage-deep-dive.md](phase-2-ask-submitMessage-deep-dive.md) — 面向初学者，按执行顺序详细讲 `ask()`、`submitMessage()`、`processUserInput()`、`query()` 的接缝与状态流转
+- [phase-2-processUserInputBase-deep-dive.md](phase-2-processUserInputBase-deep-dive.md) — 单独拆 `processUserInputBase()`，重点看变量里装了什么、输入如何被分流、图片和附件如何进入消息数组
+- [phase-2-processUserInput-image-debug.md](phase-2-processUserInput-image-debug.md) — 只讲图片相关调试：为什么 headless preset 看不到图片、如何构造 image block / pasted image、断点时该看哪些变量
 
 - [x] `src/query.ts` — 核心查询循环（1732 行）
   - [x] `query()` AsyncGenerator 入口，委托给 `queryLoop()`

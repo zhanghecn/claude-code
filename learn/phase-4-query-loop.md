@@ -277,6 +277,1247 @@ params = 只读输入
 state  = 跨迭代可变状态
 ```
 
+这里先不要急着看 `while (true)`。先把 `params` 里面每个名字当成一个真实对象看清楚。
+
+### 2.1 `QueryParams` 变量词典
+
+源码类型在 `src/query.ts`：
+
+```ts
+export type QueryParams = {
+  messages: Message[]
+  systemPrompt: SystemPrompt
+  userContext: { [k: string]: string }
+  systemContext: { [k: string]: string }
+  canUseTool: CanUseToolFn
+  toolUseContext: ToolUseContext
+  fallbackModel?: string
+  querySource: QuerySource
+  maxOutputTokensOverride?: number
+  maxTurns?: number
+  skipCacheWrite?: boolean
+  taskBudget?: { total: number }
+  deps?: QueryDeps
+}
+```
+
+这一节以后我不再用“作用：xxx”这种写法。每个重要变量都按同一个读法拆：
+
+```text
+它装什么
+  变量里真实保存的数据类型 / 数据形状
+
+谁写它
+  这个值通常从哪里传进来，或者哪段逻辑生成它
+
+谁读它
+  后面哪段代码会消费它
+
+什么时候会变
+  是整个 query 固定不变，还是每轮 while(true) 会接力更新
+```
+
+你读 `queryLoop()` 时可以先把变量分成两堆：
+
+```text
+params.*
+  = 外层 QueryEngine 给 queryLoop 的“起始输入”
+  = 大部分字段在本次 query 生命周期内不重新赋值
+
+state.*
+  = queryLoop 自己维护的“循环状态”
+  = 每次 continue 前可能被重建，下一轮 while(true) 再读取
+```
+
+下面逐个拆。
+
+#### `messages`
+
+`messages` 是当前 query 的起始消息数组。
+
+它不是用户刚输入的原始字符串，也不是 transcript 文件内容。它是已经经过 `processUserInput()`、`QueryEngine.submitMessage()` 整理后的内部 `Message[]`。
+
+一个最小例子：
+
+```ts
+messages = [
+  {
+    type: 'user',
+    uuid: 'u1',
+    message: {
+      role: 'user',
+      content: '帮我分析 src/query.ts'
+    }
+  }
+]
+```
+
+如果用户带了图片、附件、slash command 展开内容，它可能长这样：
+
+```ts
+messages = [
+  user('解释这张图'),
+  attachment({ type: 'image', ... }),
+  user({ isMeta: true, content: 'slash command 展开后的隐藏提示' }),
+  attachment({ type: 'command_permissions', allowedTools: ['Read', 'Grep'] })
+]
+```
+
+进入 `queryLoop()` 后，第一轮会用它初始化：
+
+```ts
+state.messages = params.messages
+```
+
+后面每次模型调用工具后，`state.messages` 会被改成：
+
+```ts
+messagesForQuery + assistantMessages + toolResults
+```
+
+所以 `params.messages` 是起点，`state.messages` 才是后面每轮接力的当前状态。
+
+你可以这样记：
+
+```text
+params.messages
+  = QueryEngine 交给 queryLoop 的第一包消息
+
+state.messages
+  = queryLoop 每一轮真正拿来继续跑的消息
+
+messagesForQuery
+  = state.messages 经过 compact/snip/microcompact/autocompact 处理后，当前这一轮真正发给模型的消息
+```
+
+#### `systemPrompt`
+
+`systemPrompt` 是本轮最终要给模型的系统提示词数组。
+
+它在 `QueryEngine.submitMessage()` 前面已经拼好了，来源包括：
+
+```text
+默认 system prompt
+  + customSystemPrompt 或 defaultSystemPrompt
+  + memoryMechanicsPrompt
+  + appendSystemPrompt
+```
+
+形状接近：
+
+```ts
+systemPrompt = [
+  'You are Claude Code...',
+  'Follow these tool-use rules...',
+  'Additional user-provided system prompt...'
+]
+```
+
+在 `queryLoop()` 里它先保持不动。真正发 API 前，会和 `systemContext` 再合并：
+
+```ts
+const fullSystemPrompt = asSystemPrompt(
+  appendSystemContext(systemPrompt, systemContext),
+)
+```
+
+然后 `queryModel()` 还会继续追加一些 API 层需要的前缀，例如 attribution header、CLI sys prompt prefix、advisor instructions 等。
+
+所以：
+
+```text
+systemPrompt
+  = QueryEngine 已经拼好的基础系统提示词
+
+fullSystemPrompt
+  = systemPrompt + systemContext
+
+queryModel() 里的 system
+  = fullSystemPrompt + API 层补充 + cache_control 等结构
+```
+
+它在 `queryLoop()` 里不跟着工具结果变化。即使模型调用了 5 次工具，`systemPrompt` 还是同一个数组。
+
+真正变化的是 `messagesForQuery`，也就是用户消息、assistant 消息、tool_result 这一条链。
+
+模拟一下：
+
+```ts
+systemPrompt = [
+  '你是 Claude Code...',
+  '使用工具前遵守这些规则...',
+]
+
+systemContext = {
+  cwd: '/home/zhangxuan/project/ai/claude-code',
+  platform: 'linux',
+}
+
+fullSystemPrompt = appendSystemContext(systemPrompt, systemContext)
+```
+
+然后 `deps.callModel()` 收到的是：
+
+```ts
+{
+  messages: prependUserContext(messagesForQuery, userContext),
+  systemPrompt: fullSystemPrompt,
+  ...
+}
+```
+
+所以 `systemPrompt` 的后续消费点非常明确：
+
+```text
+systemPrompt
+  -> appendSystemContext(systemPrompt, systemContext)
+  -> fullSystemPrompt
+  -> deps.callModel({ systemPrompt: fullSystemPrompt })
+  -> queryModelWithStreaming()
+  -> queryModel()
+  -> 最终 API 请求体里的 system 字段
+```
+
+#### `userContext`
+
+`userContext` 是附加给用户侧的上下文，不是普通用户输入。
+
+它来自 `fetchSystemPromptParts()`、coordinator context、MCP/工作目录等上下文构建逻辑。形状是一个 key-value 对象：
+
+```ts
+userContext = {
+  cwd: '/home/zhangxuan/project/ai/claude-code',
+  platform: 'linux',
+  today: '2026-05-06',
+  ...
+}
+```
+
+真正发模型前，`queryLoop()` 会把它 prepend 到消息里：
+
+```ts
+messages: prependUserContext(messagesForQuery, userContext)
+```
+
+也就是说，它最终会影响模型看到的用户上下文，但它不是 `messages` 数组里的普通 `user` message。
+
+对初学者来说，最容易混的是：
+
+```text
+user message
+  = 用户真实说的话，比如“帮我解释 queryLoop”
+  = 在 messages 数组里
+
+userContext
+  = 客户端补给模型看的环境信息，比如 cwd、日期、平台
+  = 不直接作为 params.messages 的一项出现
+  = 发 API 前由 prependUserContext() 临时拼进去
+```
+
+所以如果你在 `state.messages` 里没看到 `cwd`，不代表模型看不到 `cwd`。它可能是在 `deps.callModel()` 前才被 `prependUserContext()` 加进去。
+
+#### `systemContext`
+
+`systemContext` 是要追加到系统提示词里的上下文对象。
+
+形状也类似：
+
+```ts
+systemContext = {
+  currentDirectory: '/home/zhangxuan/project/ai/claude-code',
+  gitBranch: 'main',
+  ...
+}
+```
+
+它在这里被使用：
+
+```ts
+appendSystemContext(systemPrompt, systemContext)
+```
+
+所以 `systemContext` 的去向是 system prompt，不是 user messages。
+
+它和 `userContext` 的区别可以这样看：
+
+```text
+systemContext
+  -> appendSystemContext()
+  -> 进入 system prompt
+  -> 更像“规则/运行环境说明”
+
+userContext
+  -> prependUserContext()
+  -> 进入 user-side messages
+  -> 更像“当前请求的环境上下文”
+```
+
+#### `canUseTool`
+
+`canUseTool` 是工具执行前的权限裁决函数。
+
+模型发出：
+
+```ts
+tool_use: Bash({ command: 'rm -rf /tmp/x' })
+```
+
+并不代表马上执行。后面会进入：
+
+```text
+queryLoop()
+  -> runTools()
+  -> runToolUse()
+  -> checkPermissionsAndCallTool()
+  -> canUseTool(...)
+```
+
+`canUseTool` 返回类似：
+
+```ts
+{ behavior: 'allow' }
+```
+
+或者：
+
+```ts
+{ behavior: 'deny', message: '...' }
+```
+
+所以它是模型 tool_use 和本地真实工具执行之间的一道权限闸门。
+
+在 `QueryEngine` 里传进来的是：
+
+```ts
+canUseTool: wrappedCanUseTool
+```
+
+`wrappedCanUseTool` 会在原始 `canUseTool` 外面多做一件事：如果被拒绝，就把拒绝信息记到 `permissionDenials`，最后 SDK result 里可以返回这些拒绝记录。
+
+一个最小数据流：
+
+```text
+assistant message 里出现 tool_use
+  {
+    type: 'tool_use',
+    id: 'toolu_1',
+    name: 'Bash',
+    input: { command: 'pwd' }
+  }
+
+queryLoop 收集到 toolUseBlocks[]
+
+runTools(toolUseBlocks, assistantMessages, canUseTool, toolUseContext)
+
+runToolUse()
+  -> 找到 Bash 工具
+  -> 校验 input
+  -> canUseTool(...)
+  -> 允许才执行 Bash.call(...)
+```
+
+所以 `canUseTool` 不负责“找工具”，也不负责“执行工具”。它只在真正执行前回答一个问题：
+
+```text
+这次 tool_use 在当前权限上下文下能不能跑？
+```
+
+#### `toolUseContext`
+
+`toolUseContext` 是工具执行期间共享的大上下文。
+
+它不是单个工具的输入，而是所有工具执行时都可能需要的环境包。
+
+里面通常包括：
+
+```text
+options.tools
+  当前可用工具列表
+
+options.mainLoopModel
+  当前主循环模型
+
+options.mcpClients
+  MCP 客户端列表
+
+getAppState / setAppState
+  读写全局状态
+
+abortController
+  用户中断时取消模型流和工具执行
+
+readFileState
+  记录读过哪些文件，用于附件、memory 去重等
+
+queryTracking
+  queryLoop 里追加的链路追踪信息
+```
+
+所以你可以把它理解成：
+
+```text
+toolUseContext = 工具执行期的运行环境
+```
+
+模型给的 `tool_use.input` 只是“这个工具的参数”。
+
+`toolUseContext` 是“执行这个工具时可用的系统环境”。
+
+你可以把它想成“工具运行时背包”：
+
+```ts
+toolUseContext = {
+  options: {
+    tools: [Read, Grep, Bash, ...],
+    mainLoopModel: '...',
+    isNonInteractiveSession: true,
+    mcpClients: [...],
+    agentDefinitions: {...},
+  },
+  abortController,
+  readFileState,
+  getAppState,
+  setAppState,
+  ...
+}
+```
+
+它会变化。比如：
+
+```text
+queryLoop 开始
+  toolUseContext.queryTracking 还没有
+
+本轮 while 顶部
+  queryLoop 生成 queryTracking
+  toolUseContext = { ...toolUseContext, queryTracking }
+
+工具执行后
+  某些工具返回 update.newContext
+  updatedToolUseContext = update.newContext
+
+下一轮 state
+  toolUseContext: toolUseContextWithQueryTracking
+```
+
+所以它被放进 `state`，不是只读 params。
+
+#### `fallbackModel`
+
+`fallbackModel` 是模型请求失败或高负载时，用来切换的备用模型。
+
+它不是每轮都用。只有底层 API 调用触发 `FallbackTriggeredError` 时才会走到。
+
+链路是：
+
+```text
+queryLoop()
+  -> deps.callModel(...)
+    -> queryModelWithStreaming()
+      -> queryModel()
+        -> withRetry(...)
+          -> 可能 throw FallbackTriggeredError
+```
+
+`queryLoop()` 捕获后会做：
+
+```ts
+if (innerError instanceof FallbackTriggeredError && fallbackModel) {
+  currentModel = fallbackModel
+  attemptWithFallback = true
+  toolUseContext.options.mainLoopModel = fallbackModel
+  yield createSystemMessage(`Switched to ...`)
+  continue
+}
+```
+
+模拟一下：
+
+```ts
+currentModel = 'claude-sonnet-x'
+fallbackModel = 'claude-haiku-x'
+```
+
+如果 `claude-sonnet-x` 触发 fallback：
+
+```text
+当前这一轮 API 请求丢弃
+切到 claude-haiku-x
+重试当前轮请求
+```
+
+这不是“下一次用户输入才生效”，而是在当前 `queryLoop()` 这轮里重试。
+
+注意这里有两种 fallback：
+
+```text
+FallbackTriggeredError
+  = deps.callModel() 抛出来
+  = queryLoop catch 到以后切 currentModel，然后重试当前 API 请求
+
+streamingFallbackOccured
+  = 底层流式过程里发生了 streaming -> non-streaming 或模型切换
+  = queryLoop 会 tombstone 已经 yield 出去的半截 assistant 消息
+```
+
+你看到这段时：
+
+```ts
+let currentModel = getRuntimeMainLoopModel(...)
+let attemptWithFallback = true
+```
+
+可以理解成：
+
+```text
+currentModel
+  = 这一轮 API 请求当前打算用哪个模型
+
+fallbackModel
+  = 如果当前模型触发 fallback，允许切到哪个备用模型
+
+attemptWithFallback
+  = 当前 while(attemptWithFallback) 是否还要再尝试一次
+```
+
+#### `querySource`
+
+`querySource` 标记这次 query 是从哪里发起的。
+
+常见值包括：
+
+```text
+sdk
+repl_main_thread
+agent:...
+compact
+session_memory
+side_question
+```
+
+它后面会影响很多判断：
+
+```text
+是否持久化 content replacement
+是否启用 agentic query beta
+是否跳过某些 compact 阻断
+是否作为主线程消费 queued commands
+prompt cache / telemetry / analytics 如何打标签
+```
+
+比如这次从 `QueryEngine` 进来时是：
+
+```ts
+querySource: 'sdk'
+```
+
+所以后面判断主线程时会命中：
+
+```ts
+const isMainThread =
+  querySource.startsWith('repl_main_thread') || querySource === 'sdk'
+```
+
+它不是给模型看的业务字段，而是给客户端内部判断用的标签。
+
+例如：
+
+```text
+querySource === 'sdk'
+  -> 表示这是 headless/SDK 路径进来的主线程 query
+  -> queued prompt 可以被主线程消费
+
+querySource.startsWith('agent:')
+  -> 表示这是子 agent / sidechain 里的 query
+  -> content replacement 持久化位置、queued command 过滤规则会不同
+
+querySource === 'compact'
+  -> 表示这是 compact 相关 fork query
+  -> 某些 prompt-too-long 预阻塞不能在这里触发，否则 compact 自己没法跑
+```
+
+#### `maxTurns`
+
+`maxTurns` 限制的是一次 `query()` 内部最多能进行多少轮模型-工具循环。
+
+它不是 transcript 里的历史轮数。
+
+例如：
+
+```ts
+maxTurns = 3
+```
+
+可能发生：
+
+```text
+turn 1: 模型调用 Read
+turn 2: 模型调用 Grep
+turn 3: 模型调用 Bash
+turn 4: 准备继续时发现超过 maxTurns
+  -> yield attachment({ type: 'max_turns_reached' })
+  -> return { reason: 'max_turns' }
+```
+
+所以它限制的是 agent 在这次请求里自己递归行动的次数。
+
+#### `skipCacheWrite`
+
+`skipCacheWrite` 会被继续传到 API 层：
+
+```ts
+skipCacheWrite,
+```
+
+之后 `queryModel()` 在构造 API 参数和 prompt cache breakpoint 时会用到它。
+
+直观理解：
+
+```text
+正常情况下：这次请求可以参与 prompt cache 写入
+skipCacheWrite=true：这次请求尽量不要写入 prompt cache
+```
+
+它不改变模型回答逻辑，主要影响 API 请求的缓存行为。
+
+#### `taskBudget`
+
+`taskBudget` 是 API 侧的任务预算。
+
+类型是：
+
+```ts
+taskBudget?: { total: number }
+```
+
+它和 `TOKEN_BUDGET` 那套本地 continuation 不是一回事。
+
+这里的 `taskBudget` 会一路传给 `queryModel()`，最后变成 API 请求里的：
+
+```ts
+output_config.task_budget
+```
+
+如果中间发生 compact，`queryLoop()` 还会维护：
+
+```ts
+taskBudgetRemaining
+```
+
+因为 compact 后，服务器看不到 compact 前已经花掉的完整上下文，客户端要把剩余额度算出来传过去。
+
+#### `deps`
+
+`deps` 是 `queryLoop()` 的依赖注入包。
+
+它不是业务数据，而是一组“外部能力函数”：
+
+```ts
+export type QueryDeps = {
+  callModel: typeof queryModelWithStreaming
+  microcompact: typeof microcompactMessages
+  autocompact: typeof autoCompactIfNeeded
+  uuid: () => string
+}
+```
+
+生产环境里如果 `params.deps` 没传，就走：
+
+```ts
+const deps = params.deps ?? productionDeps()
+```
+
+而 `productionDeps()` 返回：
+
+```ts
+{
+  callModel: queryModelWithStreaming,
+  microcompact: microcompactMessages,
+  autocompact: autoCompactIfNeeded,
+  uuid: randomUUID,
+}
+```
+
+所以你可以把 `deps` 理解成：
+
+```text
+queryLoop 需要调模型、做 compact、生成 uuid
+但 queryLoop 自己不直接硬编码这些实现
+而是从 deps 里拿
+```
+
+这样测试时可以传假的：
+
+```ts
+deps = {
+  callModel: fakeModelThatYieldsToolUse,
+  microcompact: fakeNoopMicrocompact,
+  autocompact: fakeNoopAutocompact,
+  uuid: () => 'fixed-id',
+}
+```
+
+这能让测试不真的请求模型、不真的跑 compact，也能稳定断言 `queryLoop()` 的状态机行为。
+
+`deps` 里面 4 个函数在 `queryLoop()` 的落点如下：
+
+```text
+deps.uuid()
+  -> 第一次生成 queryTracking.chainId
+  -> compact 成功后生成新的 autoCompactTracking.turnId
+
+deps.microcompact(...)
+  -> 在每轮 API 请求前，先尝试轻量压缩 messagesForQuery
+  -> 输入是当前 messagesForQuery / toolUseContext / querySource
+  -> 输出是新的 messagesForQuery 和可选 pendingCacheEdits
+
+deps.autocompact(...)
+  -> 在 microcompact / context collapse 之后，判断是否需要完整 compact
+  -> 如果 compact 成功，会 yield compact boundary/summary/attachment
+  -> 然后当前这一轮 API 请求直接改用 compact 后的 postCompactMessages
+
+deps.callModel(...)
+  -> 真正进入模型调用层
+  -> 生产环境就是 queryModelWithStreaming()
+  -> queryLoop 用 for await 消费它吐出的 assistant / stream_event / error message
+```
+
+所以 `deps` 不是“神秘对象”，它只是把几个外部能力函数挂在一起：
+
+```text
+生成 id
+压缩上下文
+调用模型
+```
+
+测试里替换它，主要是为了控制这些外部能力，不让测试真的依赖模型、token 估算、随机 UUID。
+
+### 2.2 `State` 变量词典
+
+`State` 的源码类型在 `src/query.ts`：
+
+```ts
+type State = {
+  messages: Message[]
+  toolUseContext: ToolUseContext
+  autoCompactTracking: AutoCompactTrackingState | undefined
+  maxOutputTokensRecoveryCount: number
+  hasAttemptedReactiveCompact: boolean
+  maxOutputTokensOverride: number | undefined
+  pendingToolUseSummary: Promise<ToolUseSummaryMessage | null> | undefined
+  stopHookActive: boolean | undefined
+  turnCount: number
+  transition: Continue | undefined
+}
+```
+
+#### `state.messages`
+
+它保存“下一轮 while 开始时要处理的消息历史”。
+
+第一轮来自：
+
+```ts
+messages: params.messages
+```
+
+如果模型没有调用工具，通常不会构造下一轮 `state`，而是直接 `return { reason: 'completed' }`。
+
+如果模型调用了工具，下一轮来自：
+
+```ts
+messages: [...messagesForQuery, ...assistantMessages, ...toolResults]
+```
+
+模拟：
+
+```ts
+// 第一轮开始
+state.messages = [
+  user('帮我看 src/query.ts')
+]
+
+// 第一轮模型要读文件
+assistantMessages = [
+  assistant(tool_use Read('src/query.ts'))
+]
+
+// 工具返回结果
+toolResults = [
+  user(tool_result for Read)
+]
+
+// 第二轮开始前
+state.messages = [
+  user('帮我看 src/query.ts'),
+  assistant(tool_use Read('src/query.ts')),
+  user(tool_result for Read),
+]
+```
+
+注意 `messagesForQuery` 是这一轮从 `state.messages` 派生出来的临时变量。它可能比 `state.messages` 少，因为 compact boundary 之前的旧消息会被裁掉，也可能被 compact 改写成 summary。
+
+#### `state.toolUseContext`
+
+它保存下一轮工具执行要继续使用的运行环境。
+
+第一轮来自：
+
+```ts
+toolUseContext: params.toolUseContext
+```
+
+每轮顶部会先拿出来：
+
+```ts
+let { toolUseContext } = state
+```
+
+这里用 `let`，因为本轮内部会改它：
+
+```ts
+toolUseContext = {
+  ...toolUseContext,
+  queryTracking,
+}
+```
+
+工具执行阶段也可能返回新上下文：
+
+```ts
+if (update.newContext) {
+  updatedToolUseContext = {
+    ...update.newContext,
+    queryTracking,
+  }
+}
+```
+
+最后下一轮保存：
+
+```ts
+toolUseContext: toolUseContextWithQueryTracking
+```
+
+所以 `toolUseContext` 是“运行环境接力棒”，不是静态配置。
+
+#### `state.autoCompactTracking`
+
+它记录 autocompact 的连续状态。
+
+常见形状：
+
+```ts
+autoCompactTracking = {
+  compacted: true,
+  turnId: 'uuid-after-compact',
+  turnCounter: 0,
+  consecutiveFailures: 0,
+}
+```
+
+它主要给 `deps.autocompact()` 用：
+
+```ts
+const { compactionResult, consecutiveFailures } = await deps.autocompact(
+  messagesForQuery,
+  toolUseContext,
+  cacheSafeParams,
+  querySource,
+  tracking,
+  snipTokensFreed,
+)
+```
+
+如果 compact 成功：
+
+```ts
+tracking = {
+  compacted: true,
+  turnId: deps.uuid(),
+  turnCounter: 0,
+  consecutiveFailures: 0,
+}
+```
+
+如果后面经历了一轮工具调用：
+
+```ts
+tracking.turnCounter++
+```
+
+所以它回答的是：
+
+```text
+最近有没有 compact 过？
+compact 后又过了几轮？
+autocompact 连续失败了几次？
+```
+
+#### `state.maxOutputTokensRecoveryCount`
+
+它记录 `max_output_tokens` 恢复已经尝试了几次。
+
+场景是：模型回答被输出 token 上限截断，`queryLoop()` 不马上把错误抛给用户，而是尝试继续。
+
+第一次可能先提高 `maxOutputTokensOverride`：
+
+```ts
+transition: { reason: 'max_output_tokens_escalate' }
+```
+
+后面会追加一条隐藏 meta user message：
+
+```ts
+createUserMessage({
+  content: 'Output token limit hit. Resume directly ...',
+  isMeta: true,
+})
+```
+
+然后：
+
+```ts
+maxOutputTokensRecoveryCount: maxOutputTokensRecoveryCount + 1
+```
+
+它避免无限重试。
+
+#### `state.hasAttemptedReactiveCompact`
+
+它记录 reactive compact 是否已经试过。
+
+场景是：API 返回 prompt-too-long 或媒体过大错误。
+
+如果还没试过：
+
+```ts
+reactiveCompact.tryReactiveCompact(...)
+```
+
+如果成功：
+
+```ts
+hasAttemptedReactiveCompact: true
+transition: { reason: 'reactive_compact_retry' }
+```
+
+如果下一轮还是太长，就不能无限 compact 下去，要把错误释放出来。
+
+#### `state.maxOutputTokensOverride`
+
+它是下一次模型请求的临时 `max_tokens` 覆盖值。
+
+默认是：
+
+```ts
+maxOutputTokensOverride: params.maxOutputTokensOverride
+```
+
+如果触发输出上限恢复，可能变成：
+
+```ts
+maxOutputTokensOverride: ESCALATED_MAX_TOKENS
+```
+
+然后在 `deps.callModel()` 里传下去：
+
+```ts
+options: {
+  maxOutputTokensOverride,
+}
+```
+
+注意它不是永久改配置，只是当前恢复路径的一次请求覆盖。
+
+#### `state.pendingToolUseSummary`
+
+它保存“上一轮工具执行摘要”的后台 Promise。
+
+工具跑完后，`queryLoop()` 可能发起：
+
+```ts
+nextPendingToolUseSummary = generateToolUseSummary(...).then(...)
+```
+
+但它不阻塞马上进入下一轮模型调用。
+
+下一轮模型流结束后再消费：
+
+```ts
+if (pendingToolUseSummary) {
+  const summary = await pendingToolUseSummary
+  if (summary) {
+    yield summary
+  }
+}
+```
+
+这是一种延迟优化：
+
+```text
+工具摘要生成大约要一段时间
+下一轮模型流本来也要一段时间
+所以把摘要生成藏在下一轮模型流期间跑
+```
+
+#### `state.stopHookActive`
+
+它记录当前是否处于 stop hook 阻塞后的重试链。
+
+如果模型正常结束，没有工具调用，会跑：
+
+```ts
+handleStopHooks(...)
+```
+
+如果 hook 返回 blocking errors，`queryLoop()` 会把这些错误塞回 messages，然后继续：
+
+```ts
+stopHookActive: true
+transition: { reason: 'stop_hook_blocking' }
+```
+
+下一轮 `handleStopHooks()` 再看到 `stopHookActive`，就知道这是 hook 触发后的续跑，不是普通结束。
+
+#### `state.turnCount`
+
+它记录当前 query 内部第几轮模型-工具循环。
+
+第一轮：
+
+```ts
+turnCount: 1
+```
+
+只要有 `tool_use` 并准备继续：
+
+```ts
+const nextTurnCount = turnCount + 1
+```
+
+然后检查：
+
+```ts
+if (maxTurns && nextTurnCount > maxTurns) {
+  return { reason: 'max_turns', turnCount: nextTurnCount }
+}
+```
+
+所以 `turnCount` 不是用户对话历史里的第几轮，而是当前一次 `query()` 里面 agent 自己连续行动了几轮。
+
+#### `state.transition`
+
+它记录“上一次为什么会 continue 到当前这一轮”。
+
+第一轮是：
+
+```ts
+transition: undefined
+```
+
+后面可能是：
+
+```ts
+{ reason: 'next_turn' }
+{ reason: 'reactive_compact_retry' }
+{ reason: 'collapse_drain_retry', committed: 2 }
+{ reason: 'max_output_tokens_escalate' }
+{ reason: 'max_output_tokens_recovery', attempt: 1 }
+{ reason: 'stop_hook_blocking' }
+{ reason: 'token_budget_continuation' }
+```
+
+它主要有两个价值：
+
+```text
+1. 让恢复逻辑知道上一轮已经做过什么，避免重复做同一个恢复动作
+2. 让测试可以断言某条恢复路径确实发生过，而不用解析 message 文本
+```
+
+例如 prompt-too-long 时，context collapse drain 只允许先试一次：
+
+```ts
+state.transition?.reason !== 'collapse_drain_retry'
+```
+
+如果上一轮已经 drain 过，这一轮再遇到 413，就不要继续 drain，而是走 reactive compact 或释放错误。
+
+#### `taskBudgetRemaining`
+
+它不在 `State` 里，但你应该一起看。
+
+源码里是：
+
+```ts
+let taskBudgetRemaining: number | undefined = undefined
+```
+
+它记录 API task budget 在 compact 后还剩多少。
+
+为什么不放 `State`？源码注释已经说了：如果放进去，所有 `state = next` 的 continue 分支都要跟着传它，改动面会变大。
+
+它只在 compact 相关路径更新：
+
+```ts
+taskBudgetRemaining = Math.max(
+  0,
+  (taskBudgetRemaining ?? params.taskBudget.total) - preCompactContext,
+)
+```
+
+然后在模型请求里传下去：
+
+```ts
+taskBudget: {
+  total: params.taskBudget.total,
+  ...(taskBudgetRemaining !== undefined && {
+    remaining: taskBudgetRemaining,
+  }),
+}
+```
+
+所以它是一个 loop-local 变量：
+
+```text
+跨 while 迭代存在
+但不通过 State 接力
+只服务 task_budget + compact 这条链路
+```
+
+### 2.3 把开头那几行带入模拟数据
+
+你前面卡住的代码是这一段：
+
+```ts
+const {
+  systemPrompt,
+  userContext,
+  systemContext,
+  canUseTool,
+  fallbackModel,
+  querySource,
+  maxTurns,
+  skipCacheWrite,
+} = params
+const deps = params.deps ?? productionDeps()
+```
+
+它只是 JavaScript/TypeScript 的对象解构。
+
+如果 `params` 长这样：
+
+```ts
+params = {
+  messages: [
+    user('帮我解释 queryLoop')
+  ],
+  systemPrompt: [
+    'You are Claude Code...',
+    'Use tools carefully...',
+  ],
+  userContext: {
+    cwd: '/home/zhangxuan/project/ai/claude-code',
+    today: '2026-05-06',
+  },
+  systemContext: {
+    platform: 'linux',
+    shell: 'bash',
+  },
+  canUseTool: wrappedCanUseTool,
+  toolUseContext: processUserInputContext,
+  fallbackModel: 'claude-haiku-x',
+  querySource: 'sdk',
+  maxTurns: 10,
+  skipCacheWrite: false,
+  taskBudget: { total: 200000 },
+  deps: undefined,
+}
+```
+
+执行完解构后，局部变量变成：
+
+```ts
+systemPrompt = [
+  'You are Claude Code...',
+  'Use tools carefully...',
+]
+
+userContext = {
+  cwd: '/home/zhangxuan/project/ai/claude-code',
+  today: '2026-05-06',
+}
+
+systemContext = {
+  platform: 'linux',
+  shell: 'bash',
+}
+
+canUseTool = wrappedCanUseTool
+fallbackModel = 'claude-haiku-x'
+querySource = 'sdk'
+maxTurns = 10
+skipCacheWrite = false
+```
+
+然后这一句：
+
+```ts
+const deps = params.deps ?? productionDeps()
+```
+
+因为 `params.deps` 是 `undefined`，所以结果是：
+
+```ts
+deps = {
+  callModel: queryModelWithStreaming,
+  microcompact: microcompactMessages,
+  autocompact: autoCompactIfNeeded,
+  uuid: randomUUID,
+}
+```
+
+接下来 `queryLoop()` 又初始化 `state`：
+
+```ts
+state = {
+  messages: params.messages,
+  toolUseContext: params.toolUseContext,
+  maxOutputTokensOverride: params.maxOutputTokensOverride,
+  autoCompactTracking: undefined,
+  stopHookActive: undefined,
+  maxOutputTokensRecoveryCount: 0,
+  hasAttemptedReactiveCompact: false,
+  turnCount: 1,
+  pendingToolUseSummary: undefined,
+  transition: undefined,
+}
+```
+
+这时要注意一个分界：
+
+```text
+局部 const 变量
+  systemPrompt / userContext / systemContext / canUseTool / fallbackModel / querySource / maxTurns / skipCacheWrite / deps
+  = 本次 queryLoop 的固定输入和外部能力
+
+state
+  messages / toolUseContext / turnCount / recovery 标记
+  = 每轮 while(true) 可能被改写的接力状态
+```
+
+所以不是“把 params 全部复制一遍”。
+
+`messages` 和 `toolUseContext` 没有被上面那段 const 解构出来，因为它们要进入 `state`，后面每轮可能变。
+
+`systemPrompt` 没进 `state`，因为工具结果不会改变系统提示词。
+
+`deps` 没进 `state`，因为它是一组函数，不是每轮变化的数据。
+
+### 2.4 再回到源码块
+
+有了上面这些对象的概念，再看源码就不会只看到一堆名字。
+
 ```ts
 async function* queryLoop(
   params: QueryParams,
@@ -291,18 +1532,43 @@ async function* queryLoop(
   | ToolUseSummaryMessage,
   Terminal
 > {
-  // 这一层先把真正不会变的参数解构出来。
-  // 后面 while(true) 每轮都会继续用，但这些值本身不应该被改。
+  // 从 params 里拿出整次 queryLoop 都会复用的输入。
+  // 这些值是 QueryEngine 调 query() 时传进来的“起始配置”。
+  // 它们不是这一轮模型临时吐出来的结果，也不是工具执行后的结果。
+  // 下面 while(true) 可能跑很多次，但这些名字不会在每轮末尾通过 state 接力重写。
   const {
+    // 给模型的基础系统提示词数组。
+    // 后面会和 systemContext 拼成 fullSystemPrompt，再传给 deps.callModel()。
     systemPrompt,
+    // 给用户侧补充的环境对象，例如 cwd、日期、平台。
+    // 它不是 params.messages 里的普通 user message，发 API 前才由 prependUserContext() 拼进去。
     userContext,
+    // 给系统侧补充的环境对象。
+    // 后面通过 appendSystemContext(systemPrompt, systemContext) 进入 system prompt。
     systemContext,
+    // 工具真正执行前的权限裁决函数。
+    // 模型产生 tool_use 后，runTools()/runToolUse() 会拿它判断能不能真的执行。
     canUseTool,
+    // 主模型触发 fallback 时使用的备用模型名。
+    // 没有 fallback 发生时，它只是一路传下去，不参与普通请求。
     fallbackModel,
+    // 标记这次 query 来自 sdk / repl_main_thread / agent / compact 等来源。
+    // 后面 queued command、compact 阻断、telemetry 都会看这个标签。
     querySource,
+    // 限制这次 query 内部最多连续跑多少轮“模型 -> 工具 -> 模型”。
+    // 它不是历史会话轮数。
     maxTurns,
+    // 传给 API 层，影响 prompt cache 写入行为。
+    // 它不改变模型推理内容，主要影响缓存策略。
     skipCacheWrite,
   } = params
+  // deps 是依赖注入包。
+  // 正常运行时 params.deps 通常是 undefined，于是 productionDeps() 提供真实实现：
+  //   callModel     -> queryModelWithStreaming
+  //   microcompact  -> microcompactMessages
+  //   autocompact   -> autoCompactIfNeeded
+  //   uuid          -> randomUUID
+  // 测试时可以传假的 deps，让 queryLoop 不真的请求模型、不真的压缩、不生成随机 id。
   const deps = params.deps ?? productionDeps()
 
   // state 才是循环真正的“内脏”。
@@ -557,6 +1823,107 @@ async function* queryLoop(
       ...toolUseContext,
       messages: messagesForQuery,
     }
+```
+
+把 `while(true)` 顶部单独拆开看，会更清楚：
+
+```ts
+let { toolUseContext } = state
+const {
+  messages,
+  autoCompactTracking,
+  maxOutputTokensRecoveryCount,
+  hasAttemptedReactiveCompact,
+  maxOutputTokensOverride,
+  pendingToolUseSummary,
+  stopHookActive,
+  turnCount,
+} = state
+```
+
+这里不是在创建新业务对象，只是从 `state` 里取本轮要用的值。
+
+`toolUseContext` 单独用 `let`，因为本轮中间会重新赋值：
+
+```ts
+toolUseContext = {
+  ...toolUseContext,
+  queryTracking,
+}
+```
+
+后面还会写：
+
+```ts
+toolUseContext = {
+  ...toolUseContext,
+  messages: messagesForQuery,
+}
+```
+
+其他字段用 `const`，不是说它们永远不变，而是“在当前这一轮局部代码里不直接改这个变量名”。如果要进入下一轮，会重新构造一个 `next: State`：
+
+```ts
+const next: State = {
+  messages: [...messagesForQuery, ...assistantMessages, ...toolResults],
+  toolUseContext: toolUseContextWithQueryTracking,
+  autoCompactTracking: tracking,
+  turnCount: nextTurnCount,
+  ...
+}
+state = next
+continue
+```
+
+所以变量变化不是这样：
+
+```ts
+messages.push(...)
+turnCount++
+```
+
+而是这样：
+
+```text
+旧 state
+  -> 本轮局部变量
+  -> 算出 next State
+  -> state = next
+  -> while 下一轮重新解构
+```
+
+拿一轮工具调用模拟：
+
+```text
+while 第 1 轮顶部
+  state.turnCount = 1
+  messages = [user("分析 query.ts")]
+
+模型输出
+  assistantMessages = [assistant(tool_use Read)]
+  toolResults = [user(tool_result Read)]
+
+构造 next
+  next.turnCount = 2
+  next.messages = [user, assistant(tool_use), user(tool_result)]
+
+while 第 2 轮顶部
+  const { messages, turnCount } = state
+  messages = [user, assistant(tool_use), user(tool_result)]
+  turnCount = 2
+```
+
+这就是为什么读这段时一定要区分：
+
+```text
+params
+  外层传入，不随着 while 接力
+
+state
+  while 之间的接力对象
+
+本轮局部变量
+  从 state 解构出来，方便本轮代码读写
 ```
 
 这一大段做的其实是：
@@ -1744,7 +3111,599 @@ messages: [...messagesForQuery, ...assistantMessages, ...toolResults]
 
 ---
 
-## 6. 你应该怎样逐步读这个方法
+## 6. 把 `QueryEngine` 那句 `for await (const message of query(...))` 接进来
+
+前面这篇主要站在 `query.ts` 里看。
+
+但你现在已经是从这句一路追下来的：
+
+```ts
+for await (const message of query({
+  messages,
+  systemPrompt,
+  userContext,
+  systemContext,
+  canUseTool: wrappedCanUseTool,
+  toolUseContext: processUserInputContext,
+  fallbackModel,
+  querySource: 'sdk',
+  maxTurns,
+  taskBudget,
+})) {
+```
+
+所以这里要把“`QueryEngine` 传了什么进来”和“`queryLoop()` 真正拿着这些参数做什么”对上。
+
+### 6.1 这几个入参分别是什么
+
+```text
+messages
+  = 当前这一轮要启动 query() 时的完整消息历史快照
+  = 已经包含 processUserInput() 产出的 user / attachment / meta message
+
+systemPrompt
+  = QueryEngine 前面拼好的 system prompt
+  = 默认提示词 + 可选 memory mechanics + appendSystemPrompt
+
+userContext / systemContext
+  = 额外上下文
+  = 不是 transcript 里的普通消息，而是拼接到 API 请求前后的结构化上下文
+
+canUseTool
+  = 真正执行工具前的权限裁决函数
+
+toolUseContext
+  = 工具执行期共享上下文
+  = 工具列表、appState 读写、abortController、readFileState、MCP 等都在里面
+
+fallbackModel
+  = 当前主模型触发 fallback 时切换到哪个模型
+
+querySource
+  = 这次 query 是从哪里发起的
+  = 这里是 'sdk'
+
+maxTurns
+  = 这一轮 agentic loop 最多允许递归几次
+
+taskBudget
+  = API 侧 task budget，总量由 QueryEngine 传进来
+```
+
+### 6.2 进入 `queryLoop()` 后，这些参数怎么被分成两类
+
+`queryLoop()` 一上来就做了一个很重要的拆分：
+
+```text
+params 里的只读参数
+  vs
+state 里的跨迭代可变参数
+```
+
+也就是：
+
+```text
+systemPrompt / userContext / systemContext / canUseTool / fallbackModel / querySource / maxTurns
+  -> 整个 query() 生命周期内基本不变
+
+messages / toolUseContext / turnCount / 各种 recovery 标记
+  -> 每一轮 while(true) 都可能被改写，再交给下一轮
+```
+
+这一点非常关键。
+
+因为外层 `QueryEngine` 传进来的 `messages` 只是：
+
+```text
+query() 第一轮的初始消息历史
+```
+
+进入 `queryLoop()` 以后，真正不断被接力传下去的是：
+
+```ts
+state.messages
+```
+
+而不是 `params.messages`。
+
+换句话说：
+
+```text
+QueryEngine 只负责把第一轮“起跑线”铺好
+queryLoop() 负责之后每一轮怎么继续跑
+```
+
+### 6.3 一组最小模拟数据
+
+假设 `QueryEngine` 调 `query()` 时，传进来的是：
+
+```ts
+messages = [
+  { type: 'user', uuid: 'u1', message: { content: '帮我分析 src/query.ts' } }
+]
+
+systemPrompt = ['你是代码助手', '...']
+
+toolUseContext.options.tools = [Read, Grep, Glob, Bash]
+
+fallbackModel = 'claude-haiku-x'
+querySource = 'sdk'
+maxTurns = 10
+```
+
+那 `queryLoop()` 的第一轮起始状态就近似是：
+
+```ts
+state = {
+  messages: [
+    { type: 'user', uuid: 'u1', message: { content: '帮我分析 src/query.ts' } }
+  ],
+  toolUseContext: processUserInputContext,
+  turnCount: 1,
+  maxOutputTokensRecoveryCount: 0,
+  hasAttemptedReactiveCompact: false,
+  ...
+}
+```
+
+然后：
+
+```text
+第一轮 assistant 产生 tool_use
+  -> 跑工具
+  -> 拼出 tool_result
+  -> state.messages 变成“用户消息 + assistant(tool_use) + tool_result”
+  -> continue 第二轮
+```
+
+所以外层这一句：
+
+```ts
+for await (const message of query(...))
+```
+
+表面看是“一次调用”。
+
+但内部真实发生的是：
+
+```text
+第一次 API 请求
+  -> 可能一批工具
+  -> 第二次 API 请求
+  -> 可能再一批工具
+  -> ...
+  -> 最后 return Terminal
+```
+
+---
+
+## 7. `deps.callModel()` 往下：`queryModelWithStreaming()` 只是外壳，真正核心在 `queryModel()`
+
+当你看到：
+
+```ts
+for await (const message of deps.callModel({...})) {
+```
+
+要立刻在脑子里替换成生产环境真实实现：
+
+```text
+deps.callModel
+  = queryModelWithStreaming
+  = withStreamingVCR(queryModel(...)) 的一层包装
+```
+
+代码在：
+
+```ts
+export function productionDeps(): QueryDeps {
+  return {
+    callModel: queryModelWithStreaming,
+    microcompact: microcompactMessages,
+    autocompact: autoCompactIfNeeded,
+    uuid: randomUUID,
+  }
+}
+```
+
+所以这里的分层关系是：
+
+```text
+queryLoop()
+  -> deps.callModel(...)
+      -> queryModelWithStreaming(...)
+          -> yield* queryModel(...)
+              -> 真正发 API
+              -> 读原始 stream
+              -> 转成 AssistantMessage / StreamEvent / API error message
+```
+
+### 7.1 `queryModelWithStreaming()` 本身几乎不做业务
+
+它本质上只是：
+
+```ts
+return yield* withStreamingVCR(messages, async function* () {
+  yield* queryModel(...)
+})
+```
+
+所以真正值得看的不是 `queryModelWithStreaming()`，
+而是里面那个 `queryModel()`。
+
+### 7.2 `queryModel()` 先做的不是“读流”，而是“准备 API 请求”
+
+`queryModel()` 前半段做的事非常多，但可以归成一类：
+
+```text
+把本地 Message / Tool / Prompt 结构，变成真正能发给模型 API 的请求参数
+```
+
+主要包括：
+
+```text
+1. 处理 provider / model / beta headers
+2. 决定 tool search 是否启用
+3. 构造 toolSchemas
+4. normalizeMessagesForAPI(messages, filteredTools)
+5. 修正 tool_use / tool_result 配对
+6. 去掉当前模型不支持的 block/字段
+7. 拼最终 system prompt
+8. 构造 max_tokens / thinking / effort / task_budget / fastMode 等请求参数
+```
+
+所以：
+
+```text
+queryLoop() 传进去的是本地内部消息
+queryModel() 发出去的是 provider API 需要的 MessageParam / tool schema / stream params
+```
+
+### 7.3 真正的原始流解析发生在哪里
+
+最关键的是这一层：
+
+```ts
+for await (const part of stream) {
+  switch (part.type) {
+    case 'message_start'
+    case 'content_block_start'
+    case 'content_block_delta'
+    case 'content_block_stop'
+    case 'message_delta'
+    case 'message_stop'
+  }
+  yield { type: 'stream_event', event: part, ... }
+}
+```
+
+也就是说，`queryModel()` 一边维护自己的局部状态，一边往上层吐两类东西：
+
+```text
+1. 已经整理好的 AssistantMessage
+2. 原始底层 StreamEvent
+```
+
+### 7.4 assistant message 不是在 `message_start` 产生的
+
+这是最容易误解的一点。
+
+很多人以为：
+
+```text
+message_start 到了，就已经有 assistant message 了
+```
+
+其实不是。
+
+内部顺序更接近：
+
+```text
+message_start
+  -> 记录 partialMessage 外壳、初始 usage
+
+content_block_start
+  -> 在 contentBlocks[index] 里建一个还没拼完的 block
+
+content_block_delta
+  -> 往这个 block 里不断追加 text / thinking / partial_json
+
+content_block_stop
+  -> 这时才把单个完整 block 封装成一条 AssistantMessage
+  -> yield assistant message
+
+message_delta
+  -> 回写最终 usage / stop_reason 到“刚才已经 yield 出去的那条 assistant message”
+```
+
+所以：
+
+```text
+assistant message 的“正文内容”在 content_block_stop 才真正成形
+assistant message 的“最终 usage/stop_reason”在 message_delta 才补齐
+```
+
+### 7.5 为什么 `queryLoop()` 能一边收 assistant，一边收 `stream_event`
+
+因为 `queryModel()` 本来就同时 `yield` 这两类：
+
+```text
+assistant
+stream_event
+```
+
+所以 `queryLoop()` 的这一句：
+
+```ts
+for await (const message of deps.callModel(...)) {
+```
+
+拿到的 `message` 其实是一个混合流。
+
+可能依次是：
+
+```text
+stream_event(message_start)
+stream_event(content_block_start)
+stream_event(content_block_delta)
+assistant(text block)
+stream_event(message_delta)
+assistant(tool_use block)
+...
+```
+
+这也是为什么 `queryLoop()` 要同时维护：
+
+```text
+assistantMessages[]
+toolUseBlocks[]
+needsFollowUp
+```
+
+因为它消费的不是“最终一条回答”，而是“半结构化的内部事件流”。
+
+### 7.6 流式失败时，为什么上层很多时候收不到 throw
+
+因为 `queryModel()` 里还有一层很重的恢复逻辑：
+
+```text
+streaming 失败
+  -> 如果没禁用 fallback
+  -> 改走 non-streaming request
+  -> 把 non-streaming 的结果重新包装成 AssistantMessage
+  -> 继续 yield 给上层
+```
+
+所以对 `queryLoop()` 来说，经常出现这种情况：
+
+```text
+底层 streaming 已经失败过一次
+但上层最后仍然收到了一条正常 assistant message
+```
+
+这也是为什么：
+
+```text
+queryLoop() 里很多异常不是靠 catch 判断
+而是靠“最后一条 assistant 是正常内容还是 API error message”来分流
+```
+
+---
+
+## 8. `runTools()` / `runToolUse()`：把 `tool_use` 变成 `tool_result`，再塞回下一轮
+
+前面模型流阶段结束后，`queryLoop()` 手里通常已经有：
+
+```ts
+assistantMessages = [...]
+toolUseBlocks = [...]
+needsFollowUp = true
+```
+
+这时它会进入：
+
+```ts
+const toolUpdates = streamingToolExecutor
+  ? streamingToolExecutor.getRemainingResults()
+  : runTools(toolUseBlocks, assistantMessages, canUseTool, toolUseContext)
+```
+
+这里你可以先把 `runTools()` 理解成：
+
+```text
+一批 tool_use 的调度器
+```
+
+而 `runToolUse()` 是：
+
+```text
+单个 tool_use 的执行器
+```
+
+### 8.1 `runTools()` 做的是“批次调度”，不是单个工具执行细节
+
+它先把工具按“能否并发安全执行”分批：
+
+```text
+连续的只读 / 并发安全工具
+  -> 尽量并发跑
+
+有副作用 / 不安全工具
+  -> 串行跑
+```
+
+所以 `queryLoop()` 这层并不关心：
+
+```text
+Read 和 Grep 是不是可以并发
+Bash 和 Edit 要不要串行
+```
+
+这些都是 `runTools()` 决定的。
+
+### 8.2 `runToolUse()` 才是真正的单工具调用链
+
+一条 `tool_use` 进入 `runToolUse()` 后，主顺序大致是：
+
+```text
+1. 根据 toolUse.name 找 Tool 实现
+2. 找不到 -> 直接生成 error tool_result
+3. 已经 abort -> 直接生成取消 tool_result
+4. zod safeParse 校验 input
+5. tool.validateInput 再做业务校验
+6. canUseTool 做权限判断
+7. 跑 pre/post hooks
+8. 真正执行 tool.call()
+9. 包装成 user(tool_result) / attachment / progress
+```
+
+所以模型发出 `tool_use` 以后，不是“立刻执行系统命令”，中间要过很多关。
+
+### 8.3 为什么工具执行阶段也会不断 `yield`
+
+因为工具执行不是只返回一个最终结果。
+
+它还可能中途产出：
+
+```text
+progress
+attachment
+hook message
+最终的 user(tool_result)
+```
+
+所以 `runToolUse()` / `runTools()` 也做成了 `AsyncGenerator`。
+
+这让 `queryLoop()` 可以统一用：
+
+```ts
+for await (const update of toolUpdates) {
+```
+
+消费工具阶段的全部事件。
+
+### 8.4 `tool_result` 为什么会变成 `user` message
+
+因为从模型 API 视角看，工具结果是“用户回给 assistant 的结果块”。
+
+所以 `queryLoop()` 在收工具更新时会做：
+
+```ts
+toolResults.push(
+  ...normalizeMessagesForAPI([update.message], toolUseContext.options.tools)
+    .filter(_ => _.type === 'user'),
+)
+```
+
+这句很关键。
+
+它的意思是：
+
+```text
+工具执行阶段产出的消息，最后要整理成模型下一轮能吃的 user 消息
+```
+
+所以你最终看到的不是：
+
+```text
+tool object
+```
+
+而是：
+
+```text
+user message with tool_result block
+```
+
+### 8.5 下一轮为什么能立刻“看到”工具结果
+
+答案就藏在这句里：
+
+```ts
+messages: [...messagesForQuery, ...assistantMessages, ...toolResults]
+```
+
+这句的真实白话是：
+
+```text
+下一轮喂给模型的上下文
+= 这一轮一开始送给模型看的上下文
++ 这一轮 assistant 刚说过的话
++ 这一轮工具刚执行完回来的结果
+```
+
+所以模型第二轮看到的，不是“一个全新会话”，而是：
+
+```text
+我刚才提出了工具调用
+这里是工具返回结果
+现在请你基于这些结果继续推理
+```
+
+这就是 agentic loop 能成立的根本原因。
+
+### 8.6 一组完整状态快照
+
+假设第一轮开始时：
+
+```ts
+state.messages = [
+  user("帮我分析 src/query.ts 的 queryLoop")
+]
+turnCount = 1
+```
+
+第一轮模型输出：
+
+```ts
+assistantMessages = [
+  assistant(tool_use: Read("src/query.ts")),
+  assistant(tool_use: Grep("queryLoop", "src/query.ts"))
+]
+
+toolUseBlocks = [
+  Read(...),
+  Grep(...)
+]
+
+needsFollowUp = true
+```
+
+工具执行结束后：
+
+```ts
+toolResults = [
+  progress("Read 进行中"),
+  user(tool_result for Read),
+  user(tool_result for Grep),
+  attachment(dynamic_skill / memory / queued_command?) // 可能有，也可能没有
+]
+```
+
+构造下一轮 state：
+
+```ts
+state = {
+  messages: [
+    user("帮我分析 src/query.ts 的 queryLoop"),
+    assistant(tool_use Read),
+    assistant(tool_use Grep),
+    progress(...),
+    user(tool_result Read),
+    user(tool_result Grep),
+    ...
+  ],
+  turnCount: 2,
+  transition: { reason: 'next_turn' },
+  ...
+}
+```
+
+然后第二轮模型再基于这整包消息继续回答。
+
+---
+
+## 9. 你应该怎样逐步读这个方法
 
 如果你第一次读 `queryLoop()`，不要从上到下死抠每一行。
 
@@ -1819,7 +3778,7 @@ CHICAGO_MCP
 
 ---
 
-## 7. 这一讲读完后，下一步该深挖哪里
+## 10. 这一讲读完后，下一步该深挖哪里
 
 如果你顺着这篇继续往下钻，优先级我建议这样排：
 
@@ -1861,7 +3820,7 @@ queryLoop() 消费的是“已经被适配成 Message/StreamEvent 的流”。
 
 ---
 
-## 8. 一句话总结
+## 11. 一句话总结
 
 `runHeadlessStreaming()` 是外层编排器，`QueryEngine.submitMessage()` 是 turn 级包装层，而 `queryLoop()` 才是 Claude Code agent 真正工作的心脏。
 
