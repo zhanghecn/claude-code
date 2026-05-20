@@ -129,7 +129,6 @@ loadMemoryPrompt()
 ```
 
 AutoMem 默认是开启的，开关在 `src/memdir/paths.ts`：
-
 ```ts
 export function isAutoMemoryEnabled(): boolean {
   const envVal = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
